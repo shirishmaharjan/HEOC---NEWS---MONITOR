@@ -63,6 +63,22 @@ DEFAULTS = {
         S("EDCD", "https://edcd.gov.np", "html", "Government"),
         S("Google News - English", "https://news.google.com/rss/search?q=Nepal+outbreak+OR+dengue+OR+cholera+OR+epidemic+when:1d&hl=en-NP&gl=NP&ceid=NP:en", cat="Aggregator", full=False),
         S("Google News - Nepali", "https://news.google.com/rss/search?q=डेंगु+OR+हैजा+OR+प्रकोप+OR+महामारी+when:1d&hl=ne&gl=NP&ceid=NP:ne", cat="Aggregator", full=False),
+        S("Nagarik News", "https://nagariknews.nagariknetwork.com/feed"),
+        S("Naya Patrika", "https://nayapatrikadaily.com/feed"),
+        S("Lokaantar", "https://lokaantar.com/feed"),
+        S("Nepal Press", "https://nepalpress.com/feed"),
+        S("Nepali Times", "https://nepalitimes.com/feed"),
+        S("Pahilo Post", "https://pahilopost.com/feed"),
+        S("Rajdhani Daily", "https://rajdhani.com.np/feed"),
+        S("The Rising Nepal", "https://risingnepaldaily.com", "html"),
+        S("Rastriya Samachar Samiti (RSS)", "https://rss.com.np", "html"),
+        S("DoHS (Dept of Health Services)", "https://dohs.gov.np", "html", "Government"),
+        S("NHRC (Health Research Council)", "https://nhrc.gov.np", "html", "Government"),
+        S("NDRRMA (Disaster Authority)", "https://ndrrma.gov.np", "html", "Government"),
+        S("DHM (Weather and Flood)", "https://www.dhm.gov.np", "html", "Government"),
+        S("BIPAD Portal", "https://bipad.gov.np", "html", "Government", on=False),
+        *[S(f"Google News - {p} Province", f"https://news.google.com/rss/search?q={p}+Province+health+OR+outbreak+OR+disease+when:1d&hl=en-NP&gl=NP&ceid=NP:en",
+            cat="Local", full=False) for p in ("Koshi", "Madhesh", "Bagmati", "Gandaki", "Lumbini", "Karnali", "Sudurpashchim")],
         S("Example local portal (edit me)", "https://example.com/feed", cat="Local", on=False),
     ],
     "keywords": {
@@ -71,7 +87,7 @@ DEFAULTS = {
         "Routine": ["flood", "landslide", "earthquake", "बाढी", "पहिरो", "भूकम्प"],
     },
     "window_hours": 24, "fetch_full_text": True, "max_per_source": 40,
-    "delay_sec": 1.0, "skip_seen": True, "workers": 4,
+    "delay_sec": 1.0, "skip_seen": True, "workers": 4, "version": 3,
 }
 
 
@@ -85,9 +101,20 @@ def load_config():
                 saved["keywords"] = {"Critical": [], "Watch": saved["keywords"], "Routine": []}
             if "days_back" in saved and "window_hours" not in saved:
                 saved["window_hours"] = int(saved["days_back"]) * 24
+            saved_ver = saved.get("version", 1)
             cfg.update({k: v for k, v in saved.items() if k in cfg})
+            if saved_ver < DEFAULTS["version"]:  # old config: add the new default sources, fix categories
+                by_url = {d["url"]: d for d in DEFAULTS["sources"]}
+                for s in cfg["sources"]:
+                    if s.get("url") in by_url:
+                        s["category"] = by_url[s["url"]]["category"]
+                have = {s.get("url") for s in cfg["sources"]}
+                cfg["sources"] += [d for d in DEFAULTS["sources"] if d["url"] not in have]
+            cfg["version"] = DEFAULTS["version"]
         except Exception:
             pass
+    if not any(cfg["keywords"].get(t) for t in TIERS):  # never start with an empty keyword list
+        cfg["keywords"] = json.loads(json.dumps(DEFAULTS["keywords"]))
     cfg["sources"] = [{**S("", ""), **s} for s in cfg["sources"]]
     return cfg
 
@@ -276,11 +303,12 @@ def main_ui():
     if pw and st.text_input("Password", type="password") != pw:
         st.stop()
 
-    st.markdown("""<style>
-    .hdr{background:linear-gradient(90deg,#0b3c5d,#1d6fa5);padding:18px 24px;border-radius:10px;color:white;margin-bottom:12px}
-    .hdr h2{margin:0;color:white}.hdr p{margin:2px 0 0;opacity:.85}
-    </style><div class="hdr"><h2>🩺 Health Emergency Operation Centre - News Monitor</h2>
-    <p>Automatic scan of national and local news for health alerts</p></div>""", unsafe_allow_html=True)
+    st.markdown(
+        '<style>.hdr{background:linear-gradient(90deg,#0b3c5d,#1d6fa5);padding:18px 24px;border-radius:10px;'
+        'color:white;margin-bottom:12px}.hdr h2{margin:0;color:white}.hdr p{margin:2px 0 0;opacity:.85}</style>'
+        '<div class="hdr"><h2>🩺 Health Emergency Operation Centre - News Monitor</h2>'
+        '<p>Automatic scan of national and local news for health alerts</p></div>',
+        unsafe_allow_html=True)
 
     if "cfg" not in st.session_state:
         st.session_state.cfg = load_config()
@@ -307,8 +335,9 @@ def main_ui():
         if st.button("↩️ Reset to defaults"):
             if CONFIG_FILE.exists():
                 CONFIG_FILE.unlink()
-            for k in ("cfg", "src_df", "result"):
-                st.session_state.pop(k, None)
+            for k in list(st.session_state.keys()):
+                if k in ("cfg", "src_df", "result", "src_editor") or k.startswith("kw_"):
+                    st.session_state.pop(k, None)
             st.rerun()
 
     t_dash, t_src, t_kw, t_hist, t_help = st.tabs(["🏠 Dashboard", "📰 Sources", "🔑 Keywords", "🗂 History", "❓ Help"])
@@ -336,6 +365,11 @@ def main_ui():
 
     with t_kw:
         st.caption("One keyword per line, English or Nepali. An article's priority is the highest level it matches.")
+        def _restore_kw():
+            for t in TIERS:
+                st.session_state[f"kw_{t}"] = "\n".join(DEFAULTS["keywords"][t])
+
+        st.button("↩️ Restore default keywords", on_click=_restore_kw)
         cols, kw = st.columns(3), {}
         for c, tier, hint in zip(cols, TIERS, ["Act first", "Keep an eye on", "Background"]):
             with c:
