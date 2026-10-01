@@ -2,7 +2,7 @@
 HEOC News Monitor v3
 Run UI:  streamlit run app.py          (administrators add ?admin=1 to the link)
 Run CLI: python app.py --cli           (for scheduled runs)
-Packages: streamlit requests beautifulsoup4 feedparser pandas trafilatura openpyxl
+Packages: streamlit requests beautifulsoup4 feedparser pandas trafilatura openpyxl reportlab
 """
 import calendar
 import html
@@ -437,6 +437,131 @@ def to_excel(df):
     return buf.getvalue()
 
 
+def to_pdf(df, sdf, name, hours=None, kw=None):
+    """Shareable PDF summary: scan dates, window, keywords, counts, source status and the full article list with links."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    except ImportError:
+        return None
+    from collections import Counter
+
+    # Optional Nepali font: put NotoSansDevanagari-Regular.ttf (or any Devanagari .ttf) next to app.py
+    deva = False
+    for f in (BASE / "NotoSansDevanagari-Regular.ttf", BASE / "fonts" / "NotoSansDevanagari-Regular.ttf",
+              Path("/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf"), Path("C:/Windows/Fonts/Nirmala.ttf")):
+        if f.exists():
+            try:
+                pdfmetrics.registerFont(TTFont("Deva", str(f)))
+                deva = True
+                break
+            except Exception:
+                pass
+
+    DEV = re.compile(r"([\u0900-\u097F][\u0900-\u097F\s\u200c\u200d]*)")
+
+    def t(s):  # safe text for PDF: Nepali uses the Nepali font if available, other unsupported symbols are dropped
+        out = []
+        for i, part in enumerate(DEV.split(str(s))):
+            if i % 2:
+                out.append(f'<font name="Deva">{html.escape(part)}</font>' if deva else "[Nepali text]")
+            else:
+                out.append(html.escape(part.encode("cp1252", "ignore").decode("cp1252")))
+        return "".join(out)
+
+    H = lambda size, **k: ParagraphStyle("s", fontName=k.pop("font", "Helvetica"), fontSize=size, leading=size + 3, **k)
+    body, small, bold = H(8.5), H(7.5), H(8.5, font="Helvetica-Bold")
+    h1, h2 = H(18, font="Helvetica-Bold", textColor=colors.HexColor("#0b3c5d")), H(12, font="Helvetica-Bold", textColor=colors.HexColor("#0b3c5d"), spaceBefore=8, spaceAfter=4)
+    white = H(8.5, font="Helvetica-Bold", textColor=colors.white)
+
+    # dates
+    try:
+        end = datetime.strptime(name, "%Y%m%d_%H%M%S")
+        extracted = end.strftime("%A, %d %B %Y, %H:%M") + " Nepal time"
+        window = (f"Last {int(hours)} hours: {(end - timedelta(hours=float(hours))).strftime('%d %b %Y %H:%M')} to {end.strftime('%d %b %Y %H:%M')} (NPT)"
+                  if hours else "Not recorded for this saved scan")
+    except ValueError:
+        extracted, window = name, "Not recorded"
+
+    n = len(df)
+    cnt = {tier: int((df.priority == tier).sum()) if n else 0 for tier in TIERS}
+    ok = int((sdf.status == "OK").sum()) if len(sdf) else 0
+    bad = sdf[sdf.status != "OK"] if len(sdf) else sdf
+    kc = Counter(k.strip() for s in (df.matched_keywords if n else []) for k in str(s).split(",") if k.strip())
+
+    story = [Paragraph("Health Emergency Operation Centre - News Monitor", h1),
+             Paragraph("Summary report of national and local news health alerts", body), Spacer(1, 6)]
+
+    # overview table
+    ov = [[Paragraph("Data extracted on", bold), Paragraph(t(extracted), body)],
+          [Paragraph("Time window", bold), Paragraph(t(window), body)],
+          [Paragraph("Articles found", bold), Paragraph(f"{n}  (Critical: {cnt['Critical']}  |  Watch: {cnt['Watch']}  |  Routine: {cnt['Routine']})", body)],
+          [Paragraph("Sources", bold), Paragraph(f"{ok} read successfully, {len(bad)} unavailable", body)]]
+    tb = Table(ov, colWidths=[40 * mm, 227 * mm])
+    tb.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.4, colors.lightgrey), ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#eef3f8")),
+                            ("VALIGN", (0, 0), (-1, -1), "TOP")]))
+    story += [tb]
+
+    # keywords
+    story.append(Paragraph("Keywords monitored", h2))
+    if kw:
+        for tier in TIERS:
+            story.append(Paragraph(f"<b>{tier}:</b> {t(', '.join(kw.get(tier, [])) or '-')}", body))
+    if kc:
+        story.append(Paragraph("Most frequent keywords in this scan", h2))
+        story.append(Paragraph(t(",  ".join(f"{k} ({v})" for k, v in kc.most_common(15))), body))
+
+    # per source
+    if n:
+        story.append(Paragraph("Articles per source", h2))
+        per = df.groupby("source").size().sort_values(ascending=False)
+        story.append(Paragraph(t(",  ".join(f"{s} ({c})" for s, c in per.items())), body))
+    if len(bad):
+        story.append(Paragraph("Sources unavailable this time", h2))
+        story.append(Paragraph(t(",  ".join(f"{r.source} ({explain(r.note)})" for r in bad.itertuples())), body))
+
+    # article list
+    story.append(Paragraph("Article list (same content as the Excel file)", h2))
+    if not n:
+        story.append(Paragraph("No matching articles in this time window.", body))
+    else:
+        rows = [[Paragraph(x, white) for x in ("#", "Priority", "Title (click to open)", "Source", "Published (NPT)", "Keywords matched")]]
+        for i, r in enumerate(df.to_dict("records"), 1):
+            url = html.escape(str(r["url"]), quote=True)
+            rows.append([Paragraph(str(i), small), Paragraph(t(r["priority"]), bold),
+                         Paragraph(f'<a href="{url}" color="#0563C1">{t(r["title"])}</a><br/><font size="6.5" color="#666666">{html.escape(str(r["url"]))}</font>', small),
+                         Paragraph(t(f'{r["source"]} ({r["category"]})'), small),
+                         Paragraph(t(r["published_npt"] or "date not found - verify"), small),
+                         Paragraph(t(r["matched_keywords"]), small)])
+        art = Table(rows, colWidths=[8 * mm, 19 * mm, 112 * mm, 38 * mm, 27 * mm, 63 * mm], repeatRows=1)
+        style = [("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0b3c5d")), ("GRID", (0, 0), (-1, -1), 0.3, colors.lightgrey),
+                 ("VALIGN", (0, 0), (-1, -1), "TOP")]
+        pale = {"Critical": "#F8D7DA", "Watch": "#FFE8CC", "Routine": "#D6F0E0"}
+        for i, r in enumerate(df.to_dict("records"), 1):
+            style.append(("BACKGROUND", (1, i), (1, i), colors.HexColor(pale.get(r["priority"], "#FFFFFF"))))
+        art.setStyle(TableStyle(style))
+        story.append(art)
+    story += [Spacer(1, 8), Paragraph("This tool is a first filter. A researcher should confirm each item before reporting.", small)]
+
+    def footer(c, d):
+        c.saveState()
+        c.setFont("Helvetica", 7.5)
+        c.setFillColor(colors.grey)
+        c.drawString(15 * mm, 8 * mm, f"HEOC News Monitor - scan {fmt_run(name)} (NPT)")
+        c.drawRightString(282 * mm, 8 * mm, f"Page {d.page}")
+        c.restoreState()
+
+    buf = io.BytesIO()
+    SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=15 * mm, rightMargin=15 * mm, topMargin=14 * mm, bottomMargin=16 * mm,
+                      title="HEOC News Monitor Summary").build(story, onFirstPage=footer, onLaterPages=footer)
+    return buf.getvalue()
+
+
 def latest_result():
     runs = sorted(RUNS_DIR.glob("*/meta.csv"), reverse=True) if RUNS_DIR.exists() else []
     for p in runs:
@@ -520,13 +645,19 @@ def render_results(df, sdf, name, zbytes, key):
                 "url": st.column_config.LinkColumn("Link", display_text="Open"), "published_npt": "Published (NPT)",
                 "date_note": "Note", "matched_keywords": "Keywords"})
         stamp = file_stamp(name)
-        d1, d2, d3 = st.columns(3)
+        d1, d2, d3, d4 = st.columns(4)
         xl = to_excel(df)
         if xl:
             d1.download_button("⬇️ Excel (colour-coded)", xl, f"HEOC_News_{stamp}.xlsx",
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{key}_x")
         d2.download_button("⬇️ CSV", df.to_csv(index=False, encoding="utf-8-sig"), f"HEOC_News_{stamp}.csv", "text/csv", key=f"{key}_c")
         d3.download_button("⬇️ ZIP (CSV + full articles)", zbytes, f"HEOC_News_{stamp}.zip", "application/zip", key=f"{key}_z")
+        cfg_now = st.session_state.get("cfg", {})
+        pdf = to_pdf(df, sdf, name, hours=cfg_now.get("window_hours") if key == "d" else None, kw=cfg_now.get("keywords"))
+        if pdf:
+            d4.download_button("⬇️ PDF (summary report)", pdf, f"HEOC_News_{stamp}.pdf", "application/pdf", key=f"{key}_pdf")
+        else:
+            d4.caption("PDF needs the `reportlab` package")
     with st.expander("Source status (which sites worked)"):
         st.dataframe(sdf, hide_index=True)
 
@@ -675,7 +806,7 @@ def main_ui():
 **How to use**
 1. Choose the **time window** (e.g. last 2 hours) and press **▶ Run scan**.
 2. Review the results. 🔴 Critical items come first. Click the title to read the news.
-3. Download **Excel**, **CSV** or **ZIP**. File names include the scan date, e.g. `HEOC_News_2026-10-01_0830.xlsx`.
+3. Download **Excel**, **CSV**, **ZIP** or **PDF**. File names include the scan date, e.g. `HEOC_News_2026-10-01_0830.xlsx`.
 
 **What the colours mean**
 - 🔴 **Critical**: outbreak words such as dengue, cholera, epidemic. Check first.
