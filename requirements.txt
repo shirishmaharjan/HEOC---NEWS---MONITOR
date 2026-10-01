@@ -5,3 +5,4 @@ feedparser
 pandas
 trafilatura
 openpyxl
+reportlab
